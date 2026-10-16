@@ -47,6 +47,8 @@ type EmbeddingIndexFile = {
 };
 
 type SemanticStatus = "idle" | "loading-index" | "loading-model" | "ready" | "fallback";
+
+type AskFeedAnswer = { answer: string; citations: string[]; retrievedCount: number; retrievalMode: "semantic" | "keyword" };
 type EmbeddingTensor = { tolist: () => number[][] };
 type TextFeatureExtractor = (
   input: string | string[],
@@ -464,6 +466,71 @@ function formatDate(value: string, withYear = true) {
   }).format(date);
 }
 
+const ASK_STOP_WORDS = new Set([
+  "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "by", "as", "at", "from", "is", "are", "was", "were", "be", "been", "being", "its", "it", "this", "that", "these", "those", "their", "they", "them", "which", "who", "what", "when", "where", "why", "how", "did", "does", "do", "has", "have", "had", "can", "could", "would", "should", "will", "may", "might", "about", "into", "over", "under", "than", "then", "also", "show", "tell", "me", "please", "any", "all", "some", "from", "latest", "recent", "feed", "research", "records", "record"
+]);
+
+type AskRetrieval = { records: ResearchRecord[]; mode: "semantic" | "keyword" };
+
+function askLexicalScore(record: ResearchRecord, question: string) {
+  const tokens = [...new Set(normalizeSearchText(question).split(" ").filter((token) => token.length > 2 && !ASK_STOP_WORDS.has(token)))];
+  if (!tokens.length) return 0;
+  const headline = normalizeSearchText(record.headline || "");
+  const body = normalizeSearchText(record.content || "");
+  const company = normalizeSearchText(`${companyOf(record)} ${record.ticker || ""}`);
+  const tags = normalizeSearchText(`${record.tags || ""} ${record.sector || ""} ${record.industry || ""}`);
+  const all = `${headline} ${body} ${company} ${tags} ${normalizeSearchText(`${record.source_type || ""} ${record.source_name || ""}`)}`;
+  const coverage = (text: string) => tokens.filter((token) => text.includes(token)).length / tokens.length;
+  const phraseBonus = all.includes(normalizeSearchText(question)) ? 0.18 : 0;
+  const score = 0.42 * coverage(headline) + 0.28 * coverage(body) + 0.18 * coverage(company) + 0.12 * coverage(tags) + phraseBonus;
+  return Math.min(1, score);
+}
+
+async function retrieveAskContext(
+  question: string,
+  records: ResearchRecord[],
+  existingVectors: Record<string, number[]> | null,
+): Promise<AskRetrieval> {
+  const lexical = records
+    .map((record) => ({ record, lexicalScore: askLexicalScore(record, question) }))
+    .filter((item) => item.lexicalScore > 0)
+    .sort((a, b) => b.lexicalScore - a.lexicalScore);
+
+  // Semantic retrieval reuses the local embedding index and model. If either is
+  // unavailable, the Q&A still works using the conservative keyword retriever.
+  try {
+    let vectors = existingVectors;
+    if (!vectors) {
+      const response = await fetch(SEMANTIC_INDEX_URL);
+      if (!response.ok) throw new Error("Semantic index unavailable");
+      const payload = await response.json() as EmbeddingIndexFile;
+      if (payload.model !== SEMANTIC_MODEL_ID || !payload.embeddings || typeof payload.embeddings !== "object") {
+        throw new Error("Semantic index is invalid");
+      }
+      vectors = payload.embeddings;
+    }
+
+    const extractor = await getTextFeatureExtractor();
+    const queryOutput = await extractor(question, { pooling: "mean", normalize: true });
+    const queryVector = queryOutput.tolist()[0];
+    if (!queryVector?.length) throw new Error("Empty query vector");
+
+    const lexicalById = new Map(lexical.map((item) => [item.record.record_id, item.lexicalScore]));
+    const ranked = records.map((record) => {
+      const storedVector = vectors?.[record.record_id];
+      const semanticScore = storedVector ? cosineSimilarity(queryVector, storedVector) : -1;
+      const lexicalScore = lexicalById.get(record.record_id) ?? 0;
+      return { record, semanticScore, lexicalScore, score: 0.68 * Math.max(0, semanticScore) + 0.32 * lexicalScore };
+    })
+      .filter((item) => item.lexicalScore > 0 || item.semanticScore >= MIN_SEMANTIC_SIMILARITY)
+      .sort((a, b) => b.score - a.score || dateValue(b.record.published_at) - dateValue(a.record.published_at));
+
+    return { records: ranked.slice(0, 12).map((item) => item.record), mode: "semantic" };
+  } catch {
+    return { records: lexical.slice(0, 12).map((item) => item.record), mode: "keyword" };
+  }
+}
+
 function priorityFor(record: ResearchRecord) {
   // Transparent heuristic, not an AI or investment recommendation.
   const text = `${record.headline} ${record.content} ${record.tags} ${record.source_type}`.toLowerCase();
@@ -534,6 +601,11 @@ export default function Home() {
   const [showAllTags, setShowAllTags] = useState(false);
   const [expandedClusters, setExpandedClusters] = useState<string[]>([]);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [askFeedOpen, setAskFeedOpen] = useState(false);
+  const [askQuestion, setAskQuestion] = useState("");
+  const [askLoading, setAskLoading] = useState(false);
+  const [askError, setAskError] = useState("");
+  const [askAnswer, setAskAnswer] = useState<AskFeedAnswer | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const rowRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const [activeIndex, setActiveIndex] = useState(0);
@@ -824,6 +896,42 @@ export default function Home() {
     setSidebarOpen(false);
   };
 
+  async function handleAskFeedSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const question = askQuestion.trim();
+    if (!question || askLoading) return;
+    setAskLoading(true);
+    setAskError("");
+    setAskAnswer(null);
+
+    try {
+      const retrieval = await retrieveAskContext(question, records, embeddingIndexRef.current);
+      const response = await fetch("/api/ask-feed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question,
+          retrievalMode: retrieval.mode,
+          // The API re-loads canonical rows by ID from the published CSV. Do not
+          // trust record content submitted by the client as evidence.
+          recordIds: retrieval.records.map((record) => record.record_id),
+        }),
+      });
+      const payload = await response.json().catch(() => ({})) as Partial<AskFeedAnswer> & { error?: string };
+      if (!response.ok) throw new Error(payload.error || "Ask the feed could not answer this question.");
+      setAskAnswer({
+        answer: typeof payload.answer === "string" ? payload.answer : "No answer was returned.",
+        citations: Array.isArray(payload.citations) ? payload.citations.filter((id): id is string => typeof id === "string") : [],
+        retrievedCount: typeof payload.retrievedCount === "number" ? payload.retrievedCount : retrieval.records.length,
+        retrievalMode: payload.retrievalMode === "semantic" ? "semantic" : "keyword",
+      });
+    } catch (error) {
+      setAskError(error instanceof Error ? error.message : "Ask the feed is temporarily unavailable. The rest of the research feed is unaffected.");
+    } finally {
+      setAskLoading(false);
+    }
+  }
+
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
@@ -832,6 +940,7 @@ export default function Home() {
         event.preventDefault();
         searchRef.current?.focus();
       } else if (event.key === "Escape") {
+        if (askFeedOpen) { setAskFeedOpen(false); return; }
         if (document.activeElement === searchRef.current) searchRef.current?.blur();
         else { setSelectedRecord(null); setSelectedCompany(null); setSidebarOpen(false); }
       } else if (!typing && activeTab !== "companies" && (event.key === "j" || event.key === "k")) {
@@ -850,7 +959,7 @@ export default function Home() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTab, filteredRecords, activeIndex, toggleSaved]);
+  }, [activeTab, filteredRecords, activeIndex, toggleSaved, askFeedOpen]);
 
   const isLight = theme === "light";
   const shell = isLight ? "bg-[#FAF9F6] text-[#1A1A1A]" : "bg-[#191918] text-[#F2F0EB]";
@@ -940,6 +1049,7 @@ export default function Home() {
               <kbd className={`hidden rounded border px-1.5 py-0.5 text-[9px] sm:inline ${border} ${muted}`}>/</kbd>
             </div>
             <button onClick={() => { if (query.trim() && !searches.includes(query.trim())) { const next = [query.trim(), ...searches].slice(0, 8); setSearches(next); try { localStorage.setItem("aequitas-saved-searches", JSON.stringify(next)); } catch {} } }} title="Save current search" className={`hidden h-9 rounded-md border px-3 text-[11px] sm:block ${border} ${muted} ${hover}`}>Save search</button>
+            <button onClick={() => { setAskFeedOpen(true); setAskError(""); }} title="Ask questions about the research feed" className={`h-9 shrink-0 rounded-md bg-[#1F4FD8] px-2.5 text-[11px] font-semibold text-white transition-colors hover:bg-[#1943B8] sm:px-3`}><span className="hidden sm:inline">Ask the feed</span><span className="sm:hidden">Ask AI</span></button>
             <div className="relative">
               <button onClick={() => setHelpOpen((open) => !open)} title="Keyboard shortcuts" aria-label="Keyboard shortcuts" className={`h-9 w-9 rounded-md border text-[13px] font-semibold ${border} ${muted} ${hover}`}>?</button>
               {helpOpen && <div className={`absolute right-0 top-11 z-50 w-56 rounded-md border p-3 shadow-lg ${panel}`}>
@@ -1154,6 +1264,104 @@ export default function Home() {
           </div>
         </section>
       </div>
+      {askFeedOpen && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-black/45 p-3 sm:p-6"
+          role="presentation"
+          onMouseDown={(event) => { if (event.target === event.currentTarget && !askLoading) setAskFeedOpen(false); }}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="ask-feed-title"
+            className={`${panel} ${border} flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border shadow-2xl`}
+          >
+            <div className={`flex items-start justify-between gap-4 border-b px-5 py-4 ${border}`}>
+              <div>
+                <h2 id="ask-feed-title" className="text-[18px] font-semibold">Ask the feed</h2>
+                <p className={`mt-1 text-[12px] ${muted}`}>Answers are grounded in retrieved research records and cite their IDs.</p>
+              </div>
+              <button type="button" onClick={() => setAskFeedOpen(false)} disabled={askLoading} aria-label="Close Ask the feed" className={`rounded-md px-2 py-1 text-lg disabled:opacity-40 ${muted} ${hover}`}>×</button>
+            </div>
+
+            <div className="min-h-0 overflow-y-auto px-5 py-4">
+              <div className="mb-3 flex flex-wrap gap-2">
+                {[
+                  "Summarize OrbitTel's network expansion",
+                  "Which companies had regulatory developments?",
+                  "What major deals are reported in the feed?",
+                ].map((suggestion) => (
+                  <button key={suggestion} type="button" onClick={() => setAskQuestion(suggestion)} className={`rounded-full border px-3 py-1.5 text-left text-[11px] ${border} ${muted} ${hover}`}>
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+
+              <form onSubmit={handleAskFeedSubmit}>
+                <label htmlFor="ask-feed-question" className="mb-1.5 block text-[12px] font-semibold">Your question</label>
+                <textarea
+                  id="ask-feed-question"
+                  value={askQuestion}
+                  onChange={(event) => setAskQuestion(event.target.value)}
+                  maxLength={600}
+                  rows={3}
+                  placeholder="Ask about trends, companies, announcements, or changes across the feed…"
+                  className={`w-full resize-y rounded-lg border bg-transparent p-3 text-[13px] leading-5 outline-none focus:border-[#1F4FD8] ${border}`}
+                />
+                <div className="mt-2 flex items-center justify-between gap-3">
+                  <span className={`text-[10px] ${muted}`}>Uses up to 12 retrieved records. Not investment advice.</span>
+                  <button type="submit" disabled={askLoading || !askQuestion.trim()} className="inline-flex h-9 shrink-0 items-center gap-2 rounded-md bg-[#1F4FD8] px-4 text-[12px] font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">
+                    {askLoading ? <><span className="animate-pulse">●</span> Researching…</> : <>Ask question <span aria-hidden="true">→</span></>}
+                  </button>
+                </div>
+              </form>
+
+              {askError && <div role="alert" className="mt-4 rounded-lg border border-[#C8372D]/30 bg-[#C8372D]/5 p-3 text-[12px] leading-5 text-[#A42B23]">{askError}</div>}
+
+              {askAnswer && (
+                <div className={`mt-5 border-t pt-4 ${border}`}>
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="text-[13px] font-semibold">Answer</h3>
+                    <span className={`text-[10px] ${muted}`}>{askAnswer.retrievedCount} records retrieved · {askAnswer.retrievalMode} retrieval</span>
+                  </div>
+                  <div className="mt-3 whitespace-pre-wrap text-[13px] leading-6">
+                    {askAnswer.answer.split(/(\[[A-Za-z0-9_-]+\])/g).map((part, index) => {
+                      const match = part.match(/^\[([A-Za-z0-9_-]+)\]$/);
+                      const citationId = match?.[1];
+                      if (citationId && askAnswer.citations.includes(citationId)) {
+                        const source = records.find((record) => record.record_id === citationId);
+                        return <button key={`${citationId}-${index}`} type="button" onClick={() => { if (source) { setAskFeedOpen(false); openRecord(source); } }} disabled={!source} className="mx-0.5 inline-flex rounded bg-[#EAF0FF] px-1.5 py-0.5 font-mono text-[11px] font-semibold text-[#1F4FD8] hover:underline disabled:opacity-50">[{citationId}]</button>;
+                      }
+                      return <span key={`answer-${index}`}>{part}</span>;
+                    })}
+                  </div>
+                  {askAnswer.citations.length > 0 ? (
+                    <div className="mt-4">
+                      <h4 className={`mb-2 text-[11px] font-semibold ${muted}`}>Cited records · click to open</h4>
+                      <div className="space-y-1.5">
+                        {askAnswer.citations.map((id) => {
+                          const source = records.find((record) => record.record_id === id);
+                          return source ? (
+                            <button key={id} type="button" onClick={() => { setAskFeedOpen(false); openRecord(source); }} className={`flex w-full items-start gap-2 rounded-md border p-2 text-left ${border} ${hover}`}>
+                              <span className="mt-0.5 shrink-0 font-mono text-[10px] font-semibold text-[#1F4FD8]">{id}</span>
+                              <span className="text-[11px] leading-4">{source.headline}</span>
+                            </button>
+                          ) : null;
+                        })}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className={`mt-3 text-[11px] leading-5 ${muted}`}>No valid record IDs were cited in this answer. Treat it as unverified and open the retrieved research records directly.</p>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className={`border-t px-5 py-3 text-[10px] ${muted} ${border}`}>
+              The assistant must answer from retrieved records only. If the records do not contain the answer, it should say so.
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
