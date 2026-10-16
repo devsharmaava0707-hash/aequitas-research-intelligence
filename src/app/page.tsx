@@ -36,6 +36,91 @@ type Tab = "feed" | "companies" | "saved" | "watchlist";
 type Theme = "dark" | "light";
 
 const DATA_ROOT = "/data/Aequitas_Research_Intelligence_Assignment_Data";
+const SEMANTIC_INDEX_URL = `${DATA_ROOT}/research_embeddings.json`;
+const SEMANTIC_MODEL_ID = "onnx-community/all-MiniLM-L6-v2-ONNX";
+const MIN_SEMANTIC_SIMILARITY = 0.32;
+
+type EmbeddingIndexFile = {
+  model: string;
+  dimensions: number;
+  embeddings: Record<string, number[]>;
+};
+
+type SemanticStatus = "idle" | "loading-index" | "loading-model" | "ready" | "fallback";
+type EmbeddingTensor = { tolist: () => number[][] };
+type TextFeatureExtractor = (
+  input: string | string[],
+  options?: { pooling?: "mean"; normalize?: boolean },
+) => Promise<EmbeddingTensor>;
+
+let featureExtractorPromise: Promise<TextFeatureExtractor> | null = null;
+
+async function getTextFeatureExtractor(): Promise<TextFeatureExtractor> {
+  if (!featureExtractorPromise) {
+    featureExtractorPromise = import("@huggingface/transformers")
+      .then(async ({ pipeline }) => {
+        const extractor = await pipeline("feature-extraction", SEMANTIC_MODEL_ID, { dtype: "q4" });
+        return extractor as unknown as TextFeatureExtractor;
+      })
+      .catch((error) => {
+        featureExtractorPromise = null;
+        throw error;
+      });
+  }
+  return featureExtractorPromise;
+}
+
+function normalizeSearchText(value: string) {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9₹]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function searchTextForRecord(record: ResearchRecord) {
+  return [
+    record.record_id,
+    record.headline,
+    record.content,
+    companyOf(record),
+    record.ticker,
+    record.sector,
+    record.industry,
+    record.source_type,
+    record.source_name,
+    record.country,
+    record.tags,
+  ].filter(Boolean).join(" ");
+}
+
+function keywordRelevance(record: ResearchRecord, query: string) {
+  const normalizedQuery = normalizeSearchText(query);
+  const tokens = [...new Set(normalizedQuery.split(" ").filter((token) => token.length > 1))];
+  if (!tokens.length) return 0;
+
+  const haystack = normalizeSearchText(searchTextForRecord(record));
+  const matchedTokens = tokens.filter((token) => haystack.includes(token)).length;
+  const tokenCoverage = matchedTokens / tokens.length;
+  const phraseBonus = haystack.includes(normalizedQuery) ? 0.2 : 0;
+  return Math.min(1, tokenCoverage * 0.8 + phraseBonus);
+}
+
+function cosineSimilarity(a: number[], b: number[]) {
+  if (!a.length || a.length !== b.length) return -1;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let index = 0; index < a.length; index++) {
+    dot += a[index] * b[index];
+    normA += a[index] * a[index];
+    normB += b[index] * b[index];
+  }
+  if (!normA || !normB) return -1;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
 
 function parseCSV(text: string): Record<string, string>[] {
   const rows: string[][] = [];
@@ -97,7 +182,7 @@ const CLUSTER_STOP_WORDS = new Set([
 
 const CLUSTER_TOKEN_ALIASES: Record<string, string> = {
   adds: "add", added: "add", adding: "add",
-  sites: "site", towers: "tower", networks: "network",
+  sites: "site", towers: "tower", networks: "network", frequencies: "frequency",
   expands: "expand", expanded: "expand", expanding: "expand", expansion: "expand",
   increases: "increase", increased: "increase", increasing: "increase",
   rises: "rise", rose: "rise", rising: "rise",
@@ -109,7 +194,7 @@ const CLUSTER_TOKEN_ALIASES: Record<string, string> = {
   improves: "improve", improved: "improve", improving: "improve",
   cities: "city", services: "service", products: "product", projects: "project",
   tariffs: "tariff", revenues: "revenue", profits: "profit", margins: "margin",
-  frequencies: "frequency", facilities: "facility", stations: "station",
+  facilities: "facility", stations: "station",
   clarified: "clarify", clarifies: "clarify", clarifying: "clarify",
 };
 
@@ -425,6 +510,11 @@ export default function Home() {
   const [selectedRecord, setSelectedRecord] = useState<ResearchRecord | null>(null);
   const [selectedCompany, setSelectedCompany] = useState<Company | null>(null);
   const [query, setQuery] = useState("");
+  const [embeddingIndex, setEmbeddingIndex] = useState<Record<string, number[]> | null>(null);
+  const embeddingIndexRef = useRef<Record<string, number[]> | null>(null);
+  const [queryVector, setQueryVector] = useState<{ query: string; vector: number[] } | null>(null);
+  const [semanticStatus, setSemanticStatus] = useState<SemanticStatus>("idle");
+  const [semanticError, setSemanticError] = useState("");
   const [sourceFilter, setSourceFilter] = useState("All sources");
   const [sectorFilter, setSectorFilter] = useState("All sectors");
   const [companyFilter, setCompanyFilter] = useState("All companies");
@@ -502,6 +592,62 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    const activeQuery = query.trim();
+    if (activeTab === "companies" || activeQuery.length < 2) {
+      setSemanticStatus("idle");
+      setSemanticError("");
+      return;
+    }
+
+    let cancelled = false;
+    const timeout = window.setTimeout(async () => {
+      try {
+        let vectors = embeddingIndexRef.current;
+        if (!vectors) {
+          setSemanticStatus("loading-index");
+          const response = await fetch(SEMANTIC_INDEX_URL);
+          if (!response.ok) {
+            throw new Error("Semantic index is missing. Run node scripts/generate-embeddings.mjs first.");
+          }
+          const payload = await response.json() as EmbeddingIndexFile;
+          if (payload.model !== SEMANTIC_MODEL_ID || !payload.embeddings || typeof payload.embeddings !== "object") {
+            throw new Error("The semantic index is invalid or was generated with a different model.");
+          }
+          vectors = payload.embeddings;
+          embeddingIndexRef.current = vectors;
+          if (!cancelled) setEmbeddingIndex(vectors);
+        }
+        if (cancelled) return;
+
+        setSemanticStatus("loading-model");
+        const extractor = await getTextFeatureExtractor();
+        if (cancelled) return;
+
+        const output = await extractor(activeQuery, { pooling: "mean", normalize: true });
+        const vector = output.tolist()[0];
+        if (!vector || vector.length !== 384 || vector.some((value) => !Number.isFinite(value))) {
+          throw new Error("The local embedding model returned an invalid query vector.");
+        }
+        if (!cancelled) {
+          setQueryVector({ query: activeQuery, vector });
+          setSemanticStatus("ready");
+          setSemanticError("");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setSemanticStatus("fallback");
+          setSemanticError(error instanceof Error ? error.message : "Semantic search is unavailable.");
+        }
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [query, activeTab]);
+
+  useEffect(() => {
     if (!selectedRecord) {
       setDocumentText("");
       setDocumentLoading(false);
@@ -559,7 +705,7 @@ export default function Home() {
     return map;
   }, [companies]);
 
-  const filteredRecords = useMemo(() => {
+  const baseFilteredRecords = useMemo(() => {
     let result = [...records];
     if (activeTab === "saved") result = result.filter((record) => savedIds.includes(record.record_id));
     if (activeTab === "watchlist") result = result.filter((record) => record.ticker && watchlistTickers.includes(record.ticker.toUpperCase()));
@@ -573,17 +719,42 @@ export default function Home() {
       result = result.filter((record) => dateValue(record.published_at) >= now - days * 86400000);
     }
     if (activeTag) result = result.filter((record) => tagsOf(record.tags).some((tag) => tag.toLowerCase() === activeTag.toLowerCase()));
-    if (query.trim()) {
-      const q = query.trim().toLowerCase();
-      result = result.filter((record) => [
-        record.record_id, record.headline, record.content, record.company, record.ticker,
-        record.sector, record.industry, record.source_type, record.source_name,
-        record.country, record.tags,
-      ].join(" ").toLowerCase().includes(q));
-    }
     result.sort((a, b) => sortOrder === "Priority" ? priorityFor(b) - priorityFor(a) : sortOrder === "Oldest first" ? dateValue(a.published_at) - dateValue(b.published_at) : dateValue(b.published_at) - dateValue(a.published_at));
     return result;
-  }, [records, activeTab, savedIds, watchlistTickers, companyFilter, sourceFilter, sectorFilter, priorityFilter, dateFilter, activeTag, query, sortOrder]);
+  }, [records, activeTab, savedIds, watchlistTickers, companyFilter, sourceFilter, sectorFilter, priorityFilter, dateFilter, activeTag, sortOrder]);
+
+  const filteredRecords = useMemo(() => {
+    const activeQuery = query.trim();
+    if (!activeQuery) return baseFilteredRecords;
+
+    const activeVector = queryVector?.query === activeQuery ? queryVector.vector : null;
+    const lexicalRows = baseFilteredRecords.map((record, baseIndex) => ({
+      record,
+      baseIndex,
+      keywordScore: keywordRelevance(record, activeQuery),
+    }));
+
+    // Before the local model has loaded, show useful keyword matches immediately.
+    if (!activeVector || !embeddingIndex) {
+      return lexicalRows
+        .filter((item) => item.keywordScore > 0)
+        .sort((a, b) => b.keywordScore - a.keywordScore || a.baseIndex - b.baseIndex)
+        .map((item) => item.record);
+    }
+
+    // Once the query vector is ready, blend semantic similarity with lexical relevance.
+    // Exact/partial keyword hits remain eligible even when their embedding score is modest.
+    return lexicalRows
+      .map((item) => {
+        const storedVector = embeddingIndex[item.record.record_id];
+        const semanticScore = storedVector ? cosineSimilarity(activeVector, storedVector) : -1;
+        const combinedScore = 0.72 * Math.max(0, semanticScore) + 0.28 * item.keywordScore;
+        return { ...item, semanticScore, combinedScore };
+      })
+      .filter((item) => item.keywordScore > 0 || item.semanticScore >= MIN_SEMANTIC_SIMILARITY)
+      .sort((a, b) => b.combinedScore - a.combinedScore || a.baseIndex - b.baseIndex)
+      .map((item) => item.record);
+  }, [baseFilteredRecords, query, queryVector, embeddingIndex]);
 
   const clusteredRecords = useMemo(() => {
     if (activeTab !== "feed") {
@@ -764,7 +935,7 @@ export default function Home() {
             <div className={`hidden h-4 border-l sm:block ${border}`} />
             <div className={`flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md border px-3 ${isLight ? "border-[#E7E5E0] bg-[#FFFFFF]" : "border-[#E7E5E0] bg-[#111315]"}`}>
               <span className={`text-[17px] ${muted}`}>⌕</span>
-              <input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search research, companies, tickers…  /" className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-[#777e86]" />
+              <input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search research, companies, concepts…  /" className="min-w-0 flex-1 bg-transparent text-[12px] outline-none placeholder:text-[#777e86]" />
               {query && <button onClick={() => setQuery("")} className={`text-[13px] text-[#6B6862]`} aria-label="Clear search">×</button>}
               <kbd className={`hidden rounded border px-1.5 py-0.5 text-[9px] sm:inline ${border} ${muted}`}>/</kbd>
             </div>
@@ -805,6 +976,15 @@ export default function Home() {
                     {activeFilters.map((filter) => <button key={filter.label} onClick={filter.clear} className={`inline-flex h-6 items-center gap-1 rounded-full border px-2 text-[11px] ${isLight ? "border-[#E7E5E0] bg-[#F2F1ED] text-[#55524D]" : "border-[#3b4248] bg-[#22272b] text-[#c3c9ce]"}`}>{filter.label}<span className="opacity-60">×</span></button>)}
                     <button onClick={clearFilters} className={`px-2 py-1 text-[11px] underline underline-offset-2 ${muted}`}>Clear all</button>
                   </div>
+                )}
+                {query.trim() && activeTab !== "companies" && (
+                  <p role="status" aria-live="polite" className={`mt-2 text-[11px] ${muted}`}>
+                    {semanticStatus === "loading-index" ? "Loading the precomputed semantic index…" :
+                      semanticStatus === "loading-model" ? "Loading the local search model. First use may take a little while…" :
+                        semanticStatus === "ready" ? "Semantic + keyword search active · query processed locally" :
+                          semanticStatus === "fallback" ? `Keyword search fallback · ${semanticError}` :
+                            "Keyword matches shown while semantic search prepares…"}
+                  </p>
                 )}
               </div>
 
