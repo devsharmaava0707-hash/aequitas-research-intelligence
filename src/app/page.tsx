@@ -87,6 +87,274 @@ function clean(value?: string) {
   return value?.trim() || "";
 }
 
+function companyOf(record: ResearchRecord) {
+  return clean(record.company) || (record.headline.includes(":") ? record.headline.split(":")[0].trim() : "");
+}
+
+const CLUSTER_STOP_WORDS = new Set([
+  "a", "an", "the", "and", "or", "to", "of", "in", "on", "for", "with", "by", "as", "at", "from", "is", "are", "was", "were", "be", "been", "being", "its", "it", "this", "that", "these", "those", "their", "they", "them", "which", "who", "while", "during", "after", "before", "about", "into", "over", "under", "than", "then", "also", "more", "less", "new", "latest", "company", "companies", "limited", "ltd", "plc", "inc", "corporation", "corp", "private", "pvt", "llp", "llc", "update", "updates", "announce", "announces", "announced", "announcement", "report", "reports", "reported", "says", "said", "states", "stated", "according", "following", "previously", "public", "market", "information", "channel", "typically", "reviewed", "alongside", "filings", "filing", "management", "commentary", "operating", "metrics", "would", "could", "should", "can", "may", "will", "has", "have", "had", "about", "around", "approximately", "roughly", "during", "quarter", "quarterly", "period", "year", "years", "month", "months", "day", "days", "said", "companys", "communications", "win", "wins", "won", "order", "orders", "worth", "contract", "contracts", "package", "programme", "program", "agreement", "agreements", "sign", "signs", "signed", "receive", "receives", "received", "launch", "launches", "launched", "open", "opens", "opened", "update", "project", "timeline", "framework", "revised", "revision", "selected", "specialist", "channels", "channel", "across", "based", "outlines", "outlining", "remains"
+]);
+
+const CLUSTER_TOKEN_ALIASES: Record<string, string> = {
+  adds: "add", added: "add", adding: "add",
+  sites: "site", towers: "tower", networks: "network",
+  expands: "expand", expanded: "expand", expanding: "expand", expansion: "expand",
+  increases: "increase", increased: "increase", increasing: "increase",
+  rises: "rise", rose: "rise", rising: "rise",
+  declines: "decline", declined: "decline", declining: "decline",
+  concludes: "conclude", concluded: "conclude", concluding: "conclude",
+  acquires: "acquire", acquired: "acquire", acquiring: "acquire",
+  partners: "partner", partnered: "partner", partnering: "partner", partnership: "partner",
+  launches: "launch", launched: "launch", launching: "launch",
+  improves: "improve", improved: "improve", improving: "improve",
+  cities: "city", services: "service", products: "product", projects: "project",
+  tariffs: "tariff", revenues: "revenue", profits: "profit", margins: "margin",
+  frequencies: "frequency", facilities: "facility", stations: "station",
+  clarified: "clarify", clarifies: "clarify", clarifying: "clarify",
+};
+
+type ClusterFeatures = {
+  record: ResearchRecord;
+  companyKey: string;
+  ticker: string;
+  titleTokens: Set<string>;
+  bodyTokens: Set<string>;
+  tagTokens: Set<string>;
+  eventFamily: string | null;
+  timestamp: number;
+};
+
+function normalizeCompanyName(value: string) {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\b(private limited|private|limited|ltd|plc|incorporated|inc|corporation|corp|pvt|llp|llc)\b/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function canonicalClusterToken(token: string) {
+  return CLUSTER_TOKEN_ALIASES[token] || token;
+}
+
+function clusterTokenSet(value: string, companyTokens: Set<string> = new Set()) {
+  const normalized = value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    // Numbers often differ between copies of the same story (180 vs 208 sites).
+    .replace(/\b\d[\d,.]*\b/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+  const tokens = normalized ? normalized.split(/\s+/) : [];
+  const result = new Set<string>();
+  for (const rawToken of tokens) {
+    const token = canonicalClusterToken(rawToken);
+    if (token.length < 2 || /^\d+$/.test(token)) continue;
+    if (CLUSTER_STOP_WORDS.has(token) || companyTokens.has(token)) continue;
+    result.add(token);
+  }
+  return result;
+}
+
+function headlineForClustering(record: ResearchRecord) {
+  const headline = clean(record.headline);
+  const colon = headline.indexOf(":");
+  if (colon > 0) {
+    const prefix = normalizeCompanyName(headline.slice(0, colon));
+    const company = normalizeCompanyName(companyOf(record));
+    // Strip the leading company label only when it is actually the company name.
+    if (prefix && (prefix === company || company.startsWith(`${prefix} `) || prefix.startsWith(`${company} `))) {
+      return headline.slice(colon + 1);
+    }
+  }
+  return headline;
+}
+
+function clusterCompanyTokens(record: ResearchRecord) {
+  return new Set(normalizeCompanyName(companyOf(record)).split(/\s+/).filter(Boolean));
+}
+
+function eventFamilyOf(record: ResearchRecord): string | null {
+  // Prefer the headline, tags, and opening sentence; later text often contains
+  // repeated generic assignment boilerplate that should not define the event.
+  const firstSentence = clean(record.content).split(/[.!?]\s+/)[0] || clean(record.content).slice(0, 260);
+  const signal = `${record.headline} ${record.tags} ${firstSentence}`.toLowerCase();
+
+  // Specific event signatures must be tested before broad categories. This is
+  // what keeps spectrum auctions, network rollouts and unit-economics updates apart.
+  if (/\bspectrum\b/.test(signal) && /\b(auction|frequency|frequencies|bandwidth|allocation)\b/.test(signal)) return "spectrum-auction";
+  if (/\b5g\b/.test(signal) && /\b(sites?|towers?|base stations?)\b/.test(signal) && /\b(add|added|adding|expand|expanded|expansion|coverage|capacity|rollout|deploy|deployed)\b/.test(signal)) return "5g-site-expansion";
+  if (/\b(data usage|usage rises|usage increases)\b/.test(signal) && /\b(per gb|cost per|cost declines|cost falls)\b/.test(signal)) return "data-usage-unit-cost";
+  if (/\b(arpu|average revenue per user|tariff mix|tariff|price per gb|recharge plan)\b/.test(signal)) return "arpu-tariff";
+  if (/\b(enterprise fibre|enterprise fiber|fibre network|fiber network)\b/.test(signal) && /\b(expand|expanded|expansion|city|cities|rollout)\b/.test(signal)) return "enterprise-network-rollout";
+  if (/\b(spectrum|frequency|frequencies)\b/.test(signal) && /\b(auction|acquire|allocation|bandwidth)\b/.test(signal)) return "spectrum-acquisition";
+  if (/\b(project timeline|completion timeline|project deadline|project milestone)\b/.test(signal)) return "project-timeline";
+  if (/\b(sustainability|esg|carbon|renewable|workplace certification)\b/.test(signal)) return "sustainability-esg";
+  if (/\b(arbitration|court|regulator|regulatory|sebi|rbi|penalty|investigation|show cause|clarification sought)\b/.test(signal)) return "regulatory-legal";
+  if (/\b(merger|acquisition|takeover|buyback|stake purchase|promoter entity|share purchase)\b/.test(signal)) return "corporate-transaction";
+  if (/\b(partner|hyperscaler|joint venture|strategic alliance|collaboration)\b/.test(signal)) return "partnership";
+  if (/\b(default|downgrade|credit rating|rating outlook|refinancing|debt repayment)\b/.test(signal)) return "credit-risk";
+  if (/\b(earnings|quarterly results|financial results|profit|ebitda|revenue guidance|margin guidance)\b/.test(signal)) return "financial-results";
+  if (/\b(contract|purchase order|wins order|awarded contract|order book)\b/.test(signal)) return "contract-order";
+  if (/\b(product launch|launches service|new service|commercial launch)\b/.test(signal)) return "product-service-launch";
+  return null;
+}
+
+function buildClusterFeatures(record: ResearchRecord): ClusterFeatures {
+  const companyName = normalizeCompanyName(companyOf(record));
+  const companyTokens = clusterCompanyTokens(record);
+  const titleTokens = clusterTokenSet(headlineForClustering(record), companyTokens);
+  const bodyTokens = clusterTokenSet(record.content || "", companyTokens);
+  const tagTokens = new Set(
+    tagsOf(record.tags)
+      .map((tag) => [...clusterTokenSet(tag)].sort().join(" "))
+      .filter(Boolean)
+  );
+  return {
+    record,
+    companyKey: companyName || (clean(record.ticker) ? `ticker ${clean(record.ticker).toLowerCase()}` : `record ${record.record_id}`),
+    ticker: clean(record.ticker).toUpperCase(),
+    titleTokens,
+    bodyTokens,
+    tagTokens,
+    eventFamily: eventFamilyOf(record),
+    timestamp: dateValue(record.published_at),
+  };
+}
+
+function sameCompanyForClustering(a: ClusterFeatures, b: ClusterFeatures) {
+  if (a.ticker && b.ticker) return a.ticker === b.ticker;
+  if (a.companyKey === b.companyKey) return true;
+  const aWords = a.companyKey.split(/\s+/).filter(Boolean);
+  const bWords = b.companyKey.split(/\s+/).filter(Boolean);
+  if (!aWords.length || !bWords.length) return false;
+  // Permit short aliases such as "OrbitTel" vs "OrbitTel Communications",
+  // but do not merge different two-word brands such as "Tata Steel" and "Tata Motors".
+  const shorter = aWords.length <= bWords.length ? aWords : bWords;
+  const longer = aWords.length <= bWords.length ? bWords : aWords;
+  return shorter[0].length >= 6 && shorter.length < longer.length && shorter.every((word, index) => word === longer[index]);
+}
+
+function weightedSetSimilarity(a: Set<string>, b: Set<string>, idf: Map<string, number>) {
+  if (!a.size || !b.size) return 0;
+  let intersectionWeight = 0;
+  let unionWeight = 0;
+  let weightA = 0;
+  let weightB = 0;
+  for (const token of a) weightA += idf.get(token) ?? 1;
+  for (const token of b) weightB += idf.get(token) ?? 1;
+  for (const token of a) {
+    const weight = idf.get(token) ?? 1;
+    unionWeight += weight;
+    if (b.has(token)) intersectionWeight += weight;
+  }
+  for (const token of b) {
+    if (!a.has(token)) unionWeight += idf.get(token) ?? 1;
+  }
+  const jaccard = unionWeight ? intersectionWeight / unionWeight : 0;
+  const containment = Math.min(weightA, weightB) ? intersectionWeight / Math.min(weightA, weightB) : 0;
+  // Jaccard rewards precision; containment protects a short headline variant.
+  return 0.75 * jaccard + 0.25 * containment;
+}
+
+function setSimilarity(a: Set<string>, b: Set<string>) {
+  if (!a.size || !b.size) return 0;
+  let intersection = 0;
+  for (const token of a) if (b.has(token)) intersection++;
+  return intersection / new Set([...a, ...b]).size;
+}
+
+function overlapCount(a: Set<string>, b: Set<string>) {
+  let count = 0;
+  for (const token of a) if (b.has(token)) count++;
+  return count;
+}
+
+const CLUSTER_GEO_TOKENS = new Set([
+  "india", "indian", "china", "chinese", "japan", "japanese", "korea", "korean", "europe", "european", "asia", "asian", "africa", "african", "america", "american", "usa", "us", "uk", "britain", "british", "australia", "australian", "canada", "canadian", "brazil", "brazilian", "russia", "russian", "uae", "dubai", "singapore", "indonesia", "indonesian", "vietnam", "vietnamese"
+]);
+
+function hasConflictingGeography(a: ClusterFeatures, b: ClusterFeatures) {
+  const geoA = new Set([...a.titleTokens, ...a.bodyTokens].filter((token) => CLUSTER_GEO_TOKENS.has(token)));
+  const geoB = new Set([...b.titleTokens, ...b.bodyTokens].filter((token) => CLUSTER_GEO_TOKENS.has(token)));
+  if (!geoA.size || !geoB.size) return false;
+  for (const token of geoA) if (geoB.has(token)) return false;
+  // Prevent merging otherwise similar announcements for different markets.
+  return true;
+}
+
+function clusterMatchScore(a: ClusterFeatures, b: ClusterFeatures, idf: Map<string, number>) {
+  if (!sameCompanyForClustering(a, b)) return null;
+  if (a.eventFamily && b.eventFamily && a.eventFamily !== b.eventFamily) return null;
+  if (hasConflictingGeography(a, b)) return null;
+
+  const daysApart = a.timestamp && b.timestamp ? Math.abs(a.timestamp - b.timestamp) / 86400000 : 0;
+  if (daysApart > 120) return null;
+
+  const headlineScore = weightedSetSimilarity(a.titleTokens, b.titleTokens, idf);
+  const bodyScore = weightedSetSimilarity(a.bodyTokens, b.bodyTokens, idf);
+  const tagScore = setSimilarity(a.tagTokens, b.tagTokens);
+  const titleOverlap = overlapCount(a.titleTokens, b.titleTokens);
+  const sameFamily = Boolean(a.eventFamily && a.eventFamily === b.eventFamily);
+  const score = 0.57 * headlineScore + 0.25 * bodyScore + 0.10 * tagScore + (sameFamily ? 0.08 : 0);
+
+  let hasEnoughEvidence = false;
+  let threshold = 0.65;
+  if (sameFamily) {
+    // Same specific event family is strong evidence, but still require shared story detail.
+    hasEnoughEvidence = (headlineScore >= 0.34 && titleOverlap >= 2) || (tagScore >= 0.80 && bodyScore >= 0.48);
+    threshold = 0.52;
+  } else if (a.eventFamily || b.eventFamily) {
+    // When only one side has a known family, demand a very strong lexical/content match.
+    hasEnoughEvidence = headlineScore >= 0.72 && titleOverlap >= 3 && (tagScore >= 0.50 || bodyScore >= 0.62);
+    threshold = 0.70;
+  } else {
+    hasEnoughEvidence = (headlineScore >= 0.61 && titleOverlap >= 3) || (headlineScore >= 0.48 && bodyScore >= 0.67 && tagScore >= 0.50);
+    threshold = 0.64;
+  }
+
+  // Similar posts far apart are more likely recurring updates than duplicates.
+  if (daysApart > 60) threshold += 0.08;
+  return hasEnoughEvidence && score >= threshold ? score : null;
+}
+
+function buildResearchClusters(filteredRecords: ResearchRecord[], allRecords: ResearchRecord[]) {
+  const allFeatures = allRecords.map(buildClusterFeatures);
+  const featuresById = new Map<string, ClusterFeatures>();
+  for (const feature of allFeatures) featuresById.set(feature.record.record_id, feature);
+  const documentFrequency = new Map<string, number>();
+  for (const feature of allFeatures) {
+    const tokens = new Set([...feature.titleTokens, ...feature.bodyTokens, ...feature.tagTokens]);
+    for (const token of tokens) documentFrequency.set(token, (documentFrequency.get(token) ?? 0) + 1);
+  }
+  const idf = new Map<string, number>();
+  for (const [token, frequency] of documentFrequency) {
+    idf.set(token, 1 + Math.log((allFeatures.length + 1) / (frequency + 1)));
+  }
+
+  const clusters: { record: ResearchRecord; related: ResearchRecord[]; feature: ClusterFeatures }[] = [];
+  for (const record of filteredRecords) {
+    const feature = featuresById.get(record.record_id) ?? buildClusterFeatures(record);
+    let bestIndex = -1;
+    let bestScore = -1;
+    for (let index = 0; index < clusters.length; index++) {
+      const score = clusterMatchScore(feature, clusters[index].feature, idf);
+      if (score !== null && score > bestScore) {
+        bestIndex = index;
+        bestScore = score;
+      }
+    }
+    if (bestIndex >= 0) clusters[bestIndex].related.push(record);
+    else clusters.push({ record, related: [], feature });
+  }
+
+  return clusters.map(({ record, related }) => ({ record, related }));
+}
+
 function unique(values: string[]) {
   return [...new Set(values.filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }
@@ -174,6 +442,7 @@ export default function Home() {
   const [searches, setSearches] = useState<string[]>([]);
   const [activeTag, setActiveTag] = useState("");
   const [showAllTags, setShowAllTags] = useState(false);
+  const [expandedClusters, setExpandedClusters] = useState<string[]>([]);
   const [helpOpen, setHelpOpen] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
   const rowRefs = useRef<Record<string, HTMLButtonElement | null>>({});
@@ -316,6 +585,13 @@ export default function Home() {
     return result;
   }, [records, activeTab, savedIds, watchlistTickers, companyFilter, sourceFilter, sectorFilter, priorityFilter, dateFilter, activeTag, query, sortOrder]);
 
+  const clusteredRecords = useMemo(() => {
+    if (activeTab !== "feed") {
+      return filteredRecords.map((record) => ({ record, related: [] as ResearchRecord[] }));
+    }
+    return buildResearchClusters(filteredRecords, records);
+  }, [filteredRecords, records, activeTab]);
+
   const displayedCompanies = useMemo(() => {
     const q = query.trim().toLowerCase();
     return companies.filter((company) => !q || [company.company, company.ticker, company.aliases, company.sector, company.industry, company.geography, company.description].join(" ").toLowerCase().includes(q));
@@ -331,7 +607,7 @@ export default function Home() {
     const sorted = [...filteredRecords].filter((record) => priorityFor(record) >= 58).sort((a, b) => priorityFor(b) - priorityFor(a) || dateValue(b.published_at) - dateValue(a.published_at));
     const seen = new Set<string>();
     return sorted.filter((record) => {
-      const key = (record.ticker || record.company || record.record_id).trim().toLowerCase();
+      const key = (companyOf(record) || record.ticker || record.record_id).trim().toLowerCase();
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -573,7 +849,7 @@ export default function Home() {
                           <span className="mt-[7px] h-2 w-2 shrink-0 rounded-full bg-[#C8372D]" />
                           <span className="min-w-0 flex-1">
                             <span style={{ fontFamily: '"Source Serif 4", Georgia, serif', fontWeight: 600, lineHeight: 1.35, color: "#1A1A1A" }} className="block truncate text-[17px]">{record.headline}</span>
-                            <span className="block truncate text-[13px] leading-[1.35] text-[#6B6862]">{record.source_name || record.source_type || "Research"} · {formatDate(record.published_at, false)} · {record.company || record.ticker || "Company unavailable"}</span>
+                            <span className="block truncate text-[13px] leading-[1.35] text-[#6B6862]">{record.source_name || record.source_type || "Research"} · {formatDate(record.published_at, false)} · {companyOf(record) || record.ticker}</span>
                           </span>
                         </button>
                       ))}
@@ -582,14 +858,38 @@ export default function Home() {
 
                   {filteredRecords.length ? (
                     <div>
-                      {filteredRecords.map((record, index) => {
-                        const previous = filteredRecords[index - 1];
+                      {clusteredRecords.map(({ record, related }, index) => {
+                        const previous = clusteredRecords[index - 1]?.record;
                         const day = record.published_at?.slice(0, 10);
                         const previousDay = previous?.published_at?.slice(0, 10);
                         const showDay = index === 0 || day !== previousDay;
+                        const expanded = expandedClusters.includes(record.record_id);
                         return <div key={record.record_id}>
                           {showDay && <div className={`sticky top-[62px] z-10 border-b px-4 py-2 text-[11px] font-medium ${isLight ? "border-[#E7E5E0] bg-[#FAF9F6] text-[#55524D]" : "border-[#2a2e32] bg-[#111315] text-[#7f8790]"} sm:px-6`}>{formatDate(record.published_at)}</div>}
                           <ResearchRow refCallback={(node) => { rowRefs.current[record.record_id] = node; }} record={record} query={query} theme={theme} isSaved={savedIds.includes(record.record_id)} onOpen={() => openRecord(record)} onToggleSave={() => toggleSaved(record.record_id)} isLight={isLight} selected={selectedRecord?.record_id === record.record_id} />
+                          {related.length > 0 && <div className={`border-b px-6 pb-2 ${border}`}>
+                            <button
+                              type="button"
+                              onClick={() => setExpandedClusters((current) => expanded ? current.filter((id) => id !== record.record_id) : [...current, record.record_id])}
+                              aria-expanded={expanded}
+                              className="text-[11px] font-medium text-[#1F4FD8] hover:underline"
+                            >
+                              {expanded ? "Hide related" : `+${related.length} related`}
+                            </button>
+                            {expanded && <div className="mt-2 border-l-2 border-[#D9E3FF] pl-2">
+                              {related.map((relatedRecord) => <ResearchRow
+                                key={relatedRecord.record_id}
+                                record={relatedRecord}
+                                query={query}
+                                theme={theme}
+                                isSaved={savedIds.includes(relatedRecord.record_id)}
+                                onOpen={() => openRecord(relatedRecord)}
+                                onToggleSave={() => toggleSaved(relatedRecord.record_id)}
+                                isLight={isLight}
+                                selected={selectedRecord?.record_id === relatedRecord.record_id}
+                              />)}
+                            </div>}
+                          </div>}
                         </div>;
                       })}
                     </div>
